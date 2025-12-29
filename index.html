@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mosaic: Athlete Explorer (Robust)</title>
+  <!-- 
+    Mosaic Standalone Application: Athlete Explorer
+    An interactive dashboard demonstrating high-performance data visualization 
+    using DuckDB-WASM and the Mosaic vgplot grammar.
+  -->
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      margin: 0; padding: 20px; background-color: #f4f4f9;
+      display: flex; flex-direction: column; align-items: center;
+    }
+    #app {
+      background: white; padding: 20px; border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none;
+    }
+    #loader {
+      text-align: center; background: white; padding: 30px;
+      border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+      max-width: 500px;
+    }
+    .btn {
+      background: #007bff; color: white; padding: 10px 20px;
+      border: none; border-radius: 4px; cursor: pointer; font-size: 1em;
+      margin-top: 10px;
+    }
+    .btn:hover { background: #0056b3; }
+    
+    /* Reset button specific styling */
+    .btn-reset {
+      background: #6c757d; color: white; padding: 4px 12px;
+      border: none; border-radius: 4px; cursor: pointer; font-size: 0.85em;
+      align-self: center; margin-left: 10px;
+    }
+    .btn-reset:hover { background: #5a6268; }
+
+    .status-msg { margin-bottom: 15px; color: #555; }
+    .error { color: #d9534f; margin-top: 15px; font-weight: bold; font-size: 0.9em; text-align: left;}
+    code { background: #eee; padding: 2px 4px; border-radius: 4px; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+
+  <div id="loader">
+    <div id="status-text" class="status-msg">Initializing DuckDB Engine...</div>
+    
+    <div id="manual-load" style="display:none; border-top: 1px solid #eee; padding-top: 20px;">
+      <p><strong>Remote load failed.</strong></p>
+      <p>Please select <code>athletes.parquet</code> manually:</p>
+      <button class="btn" onclick="document.getElementById('file-input').click()">
+        📂 Select File
+      </button>
+      <input type="file" id="file-input" style="display:none" accept=".parquet">
+    </div>
+  </div>
+  
+  <div id="app"></div>
+
+  <script type="module">
+    import * as vg from "https://esm.sh/@uwdata/vgplot";
+
+    const statusText = document.getElementById("status-text");
+    const manualLoad = document.getElementById("manual-load");
+    const appDiv = document.getElementById("app");
+    const loaderDiv = document.getElementById("loader");
+    const fileInput = document.getElementById("file-input");
+
+    const RAW_URL = "https://github.com/uwdata/mosaic/raw/refs/heads/main/data/athletes.parquet";
+    const PROXY_URL = "https://corsproxy.io/?" + encodeURIComponent(RAW_URL);
+
+    let wasm;
+
+    async function init() {
+      try {
+        wasm = await vg.wasmConnector();
+        vg.coordinator().databaseConnector(wasm);
+        statusText.textContent = "Downloading data (via proxy)...";
+        await vg.coordinator().exec(vg.loadParquet("athletes", PROXY_URL));
+        renderDashboard();
+      } catch (remoteErr) {
+        console.warn("Proxy load failed:", remoteErr);
+        statusText.textContent = "Remote load failed. Waiting for user file...";
+        manualLoad.style.display = "block";
+      }
+    }
+
+    fileInput.onchange = async (event) => {
+      const file = event.target.files[0];
+      if (!file) return;
+      manualLoad.style.display = "none";
+      statusText.textContent = "Registering file in memory...";
+      try {
+        await vg.coordinator().exec("SELECT 1");
+        const db = wasm.duckdb || wasm._duckdb;
+        const buffer = await file.arrayBuffer();
+        await db.registerFileBuffer("athletes.parquet", new Uint8Array(buffer));
+        await vg.coordinator().exec(vg.loadParquet("athletes", "athletes.parquet"));
+        renderDashboard();
+      } catch (e) {
+        console.error(e);
+        statusText.innerHTML = `<div class="error">Error: ${e.message}</div>`;
+        manualLoad.style.display = "block";
+      }
+    };
+
+    /**
+     * Renders or re-renders the Athlete Explorer dashboard.
+     * This function manages the creation of Selections and the UI specification.
+     */
+    async function renderDashboard() {
+      // 1. Disconnect previous clients to prevent memory leaks and redundant queries
+      // We keep the cache enabled (default) so re-rendering is fast.
+      vg.coordinator().clear({ cache: false });
+
+      // 2. Initialize fresh selections
+      const $category = vg.Selection.intersect();
+      const $query = vg.Selection.intersect({ include: [$category] });
+      const $hover = vg.Selection.intersect({ empty: true });
+
+      // 3. Define Reset Button: it triggers a full re-render
+      const resetBtn = document.createElement("button");
+      resetBtn.textContent = "Reset All";
+      resetBtn.className = "btn-reset";
+      resetBtn.onclick = () => renderDashboard();
+
+      // 4. Compose the dashboard
+      const spec = vg.vconcat(
+        vg.hconcat(
+          vg.menu({ label: "Sport", as: $category, from: "athletes", column: "sport" }),
+          vg.menu({ label: "Sex", as: $category, from: "athletes", column: "sex" }),
+          vg.search({
+            label: "Name", filterBy: $category, as: $query,
+            from: "athletes", column: "name", type: "contains"
+          }),
+          resetBtn
+        ),
+        vg.vspace(10),
+        vg.plot(
+          vg.dot(
+            vg.from("athletes", { filterBy: $query }),
+            { x: "weight", y: "height", fill: "sex", r: 2, opacity: 0.1 }
+          ),
+          vg.regressionY(
+            vg.from("athletes", { filterBy: $query }),
+            { x: "weight", y: "height", stroke: "sex" }
+          ),
+          vg.intervalXY({ as: $query, brush: { fillOpacity: 0, stroke: "black" } }),
+          vg.dot(
+            vg.from("athletes", { filterBy: $hover }),
+            { x: "weight", y: "height", fill: "sex", stroke: "currentColor", strokeWidth: 1, r: 3 }
+          ),
+          vg.xyDomain(vg.Fixed),
+          vg.colorDomain(vg.Fixed),
+          vg.margins({ left: 35, top: 20, right: 1 }),
+          vg.width(570),
+          vg.height(350)
+        ),
+        vg.vspace(5),
+        vg.table({
+          from: "athletes", maxWidth: 570, height: 250, filterBy: $query, as: $hover,
+          columns: ["name", "nationality", "sex", "height", "weight", "sport"],
+          width: { name: 180, nationality: 100, sex: 50, height: 50, weight: 50, sport: 100 }
+        })
+      );
+
+      loaderDiv.style.display = "none";
+      appDiv.style.display = "block";
+      appDiv.replaceChildren(spec);
+    }
+
+    init();
+  </script>
+</body>
+</html>
